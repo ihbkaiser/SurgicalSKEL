@@ -16,10 +16,10 @@ if __name__ == '__main__':
 
     from dataset import Endovis18Loader, Endovis17Loader
     from segment_anything import sam_model_registry, SamPredictor
-    from prototypes import Learnable_Prototypes, Prototype_Prompt_Encoder
+    from prototypes import Learnable_Prototypes, Prototype_Prompt_Encoder, PrototypeAwareMultiModalEncoder
     from utils import print_log, create_binary_masks, create_endovis_masks, eval_endovis, read_gt_endovis_masks
     from model import model_forward_function
-    from loss import DiceLoss, CombinedLoss  # CombinedLoss handles segmentation + skeleton recall loss
+    from loss import DiceLoss, CombinedLoss, CombinedLoss2  # CombinedLoss handles segmentation + skeleton recall loss
     from pytorch_metric_learning import losses  # for contrastive loss
 
     # --------------------- Sinkhorn (OT) Loss Functions ---------------------
@@ -91,7 +91,7 @@ if __name__ == '__main__':
 
     print("======> Load SAM for Predictor (with image_encoder)")
     if vit_mode == "h":
-        sam_checkpoint = "ckpt/sam_vit_h_4b8939.pth"
+        sam_checkpoint = "surgicalSKEL/ckpt/sam_vit_h_4b8939.pth"
     sam_full = sam_model_registry["vit_h"](checkpoint=sam_checkpoint).to(device)
     predictor = SamPredictor(sam_full)
 
@@ -136,8 +136,26 @@ if __name__ == '__main__':
     lr = 0.001
     save_dir = "./work_dirs/endovis_2018_seq1_exp/"
 
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    g = torch.Generator()
+    g.manual_seed(seed)
+
+    train_dataloader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=4, 
+        pin_memory=True,
+        generator=g
+    )
+
+    val_dataloader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=4, 
+        pin_memory=True,
+        generator=g
+    )
 
     print("======> Load Prototypes and Prototype-based Prompt Encoder")
     learnable_prototypes_model = Learnable_Prototypes(num_classes=7, feat_dim=256).to(device)
@@ -223,7 +241,6 @@ if __name__ == '__main__':
                 prototypes, 
                 cls_ids
             )
-            
 
             seg_loss = DiceLoss().to(device)(preds, masks.float())
             landmark_loss = torch.mean((landmark_sparse_pred - point_embeddings)**2) * 0.1

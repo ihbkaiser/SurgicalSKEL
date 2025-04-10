@@ -55,7 +55,7 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if vit_mode == "h":
-        sam_checkpoint = "ckpt/sam_vit_h_4b8939.pth"
+        sam_checkpoint = "surgicalSKEL/ckpt/sam_vit_h_4b8939.pth"
     sam_full = sam_model_registry["vit_h"](checkpoint=sam_checkpoint)
     sam_full.to(device)
     predictor = SamPredictor(sam_full)

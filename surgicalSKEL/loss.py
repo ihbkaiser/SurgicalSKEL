@@ -5,6 +5,7 @@ from typing import Callable, Any, Optional, Tuple
 
 def softmax_helper_dim1(x: torch.Tensor) -> torch.Tensor:
     return torch.softmax(x, 1)
+
 def reduce_loss(loss, reduction):
     reduction_enum = F._Reduction.get_enum(reduction)
     if reduction_enum == 0:
@@ -13,6 +14,7 @@ def reduce_loss(loss, reduction):
         return loss.mean()
     elif reduction_enum == 2:
         return loss.sum()
+    
 def weight_reduce_loss(loss,
                        weight = None,
                        reduction = 'mean',
@@ -29,6 +31,7 @@ def weight_reduce_loss(loss,
         elif reduction != 'none':
             raise ValueError('avg_factor can not be used with reduction="sum"')
     return loss
+
 def dice_loss(pred,
               target,
               weight=None,
@@ -39,6 +42,11 @@ def dice_loss(pred,
     
     input = pred.flatten(1)
     target = target.flatten(1).float()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    input = input.to(device)
+    target = target.to(device)
 
     a = torch.sum(input * target, 1)
     if naive_dice:
@@ -136,7 +144,130 @@ class SkeletonRecallLoss(nn.Module):
         rec = rec.mean()
         return -rec
 
+class AdaptiveSkeletonLoss(nn.Module):
+    def __init__(self, smooth=1.0, apply_nonlin=None):
+        super(AdaptiveSkeletonLoss, self).__init__()
+        self.smooth = smooth
+        self.apply_nonlin = apply_nonlin
+        
+        self.register_buffer('neighbor_kernel', self._create_neighbor_kernel())
+    
+    def _create_neighbor_kernel(self):
+        kernel = torch.ones((1, 1, 3, 3), dtype=torch.float32)
+        kernel[0, 0, 1, 1] = 0  # Center pixel
+        return kernel
+    
+    def _analyze_skeleton(self, skeleton):
+        neighbors = F.conv2d(skeleton, self.neighbor_kernel, padding=1)
+        
+        endpoints = (neighbors == 1) & (skeleton > 0.5)  # Exactly 1 neighbor
+        midpoints = (neighbors == 2) & (skeleton > 0.5)  # Exactly 2 neighbors
+        junctions = (neighbors > 2) & (skeleton > 0.5)   # More than 2 neighbors
+        
+        return endpoints, midpoints, junctions
+    
+    def _structural_similarity(self, pred_skel, gt_skel):
+        pred_endpoints, pred_midpoints, pred_junctions = self._analyze_skeleton(pred_skel)
+        gt_endpoints, gt_midpoints, gt_junctions = self._analyze_skeleton(gt_skel)
+        
+        def calculate_iou(pred, gt):
+            intersection = torch.sum(pred * gt, dim=(2, 3))
+            union = torch.sum(pred, dim=(2, 3)) + torch.sum(gt, dim=(2, 3)) - intersection
+            return (intersection + self.smooth) / (union + self.smooth)
+        
+        endpoint_iou = calculate_iou(pred_endpoints, gt_endpoints)
+        midpoint_iou = calculate_iou(pred_midpoints, gt_midpoints)
+        junction_iou = calculate_iou(pred_junctions, gt_junctions)
+        
+        gt_endpoint_count = torch.sum(gt_endpoints, dim=(2, 3))
+        gt_junction_count = torch.sum(gt_junctions, dim=(2, 3))
+        gt_midpoint_count = torch.sum(gt_midpoints, dim=(2, 3))
+        gt_total_count = gt_endpoint_count + gt_junction_count + gt_midpoint_count + self.smooth
+        
+        endpoint_weight = gt_endpoint_count / gt_total_count
+        junction_weight = gt_junction_count / gt_total_count
+        midpoint_weight = gt_midpoint_count / gt_total_count
+        
+        structural_loss = 1 - (
+            endpoint_weight * endpoint_iou + 
+            junction_weight * junction_iou + 
+            midpoint_weight * midpoint_iou
+        )
+        
+        return structural_loss.mean()
+    
+    def _medial_axis_distance(self, pred_skel, gt_skel):
+        def distance_approximation(target, reference):
+            dilated = reference.clone()
+            max_dist = 10
+            
+            distances = torch.zeros_like(target)
+            found_mask = torch.zeros_like(target, dtype=torch.bool)
+            
+            for d in range(1, max_dist + 1):
+                dilated = F.max_pool2d(dilated, kernel_size=3, stride=1, padding=1)
+                
+                new_points = (dilated > 0.5) & (target > 0.5) & (~found_mask)
+                distances[new_points] = d
+                found_mask = found_mask | new_points
+                
+                if torch.all(found_mask | (target <= 0.5)):
+                    break
+            
+            # Set max distance for unfound points
+            target_mask = (target > 0.5)
+            unfound_points = target_mask & (~found_mask)
+            distances[unfound_points] = max_dist
+            
+            total_points = torch.sum(target > 0.5, dim=(2, 3))
+            total_dist = torch.sum(distances, dim=(2, 3))
+            
+            avg_dist = total_dist / (total_points + self.smooth)
+            return avg_dist
+        
+        pred_to_gt = distance_approximation(pred_skel, gt_skel)
+        gt_to_pred = distance_approximation(gt_skel, pred_skel)
+        
+        mean_distance = (pred_to_gt + gt_to_pred) / 2
+        
+        # Normalize to [0, 1] range
+        normalized_dist = mean_distance / 10  # max_dist from above
+        
+        return normalized_dist.mean()
+    
+    def forward(self, pred_skel, gt_skel):
+        if self.apply_nonlin is not None:
+            pred_skel = self.apply_nonlin(pred_skel)
+        
+        # Ensure proper shape
+        if pred_skel.ndim == 3:
+            pred_skel = pred_skel.unsqueeze(1)
+        if gt_skel.ndim == 3:
+            gt_skel = gt_skel.unsqueeze(1)
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        pred_skel = pred_skel.to(device)
+        gt_skel = gt_skel.to(device)
+
+        intersection = torch.sum(pred_skel * gt_skel, dim=(2, 3))
+        pred_sum = torch.sum(pred_skel, dim=(2, 3))
+        gt_sum = torch.sum(gt_skel, dim=(2, 3))
+        
+        dice = (2 * intersection + self.smooth) / (pred_sum + gt_sum + self.smooth)
+        dice_loss = 1 - dice.mean()
+        
+        structural_loss = self._structural_similarity(pred_skel, gt_skel)
+        medial_loss = self._medial_axis_distance(pred_skel, gt_skel)
+        
+        avg_magnitude = (dice_loss + structural_loss + medial_loss) / 3
+        balanced_dice = dice_loss / (dice_loss + self.smooth) * avg_magnitude
+        balanced_structural = structural_loss / (structural_loss + self.smooth) * avg_magnitude
+        balanced_medial = medial_loss / (medial_loss + self.smooth) * avg_magnitude
+        
+        total_loss = balanced_dice + balanced_structural + balanced_medial
+        
+        return total_loss
 
 
 class clDiceLoss(nn.Module):
@@ -258,4 +389,21 @@ class CombinedLoss(nn.Module):
         #               self.weight_dice * loss_dice + 
         #               self.weight_srec * loss_srec)
         total_loss = loss_dice
+        return total_loss
+
+class CombinedLoss2(nn.Module):
+    def __init__(self, weight_dice=1.0, weight_skeleton=0.3):
+        super(CombinedLoss2, self).__init__()
+        self.weight_dice = weight_dice
+        self.weight_skeleton = weight_skeleton
+        
+        self.dice = DiceLoss()  
+        self.skeleton_loss = AdaptiveSkeletonLoss()
+    
+    def forward(self, mask_pred, mask_gt, skeleton_pred, skeleton_gt):
+        loss_dice = self.dice(mask_pred, mask_gt)
+        loss_skeleton = self.skeleton_loss(skeleton_pred, skeleton_gt)
+        
+        total_loss = self.weight_dice * loss_dice + self.weight_skeleton * loss_skeleton
+        
         return total_loss

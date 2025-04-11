@@ -15,6 +15,7 @@ from segment_anything.modeling.prompt_encoder import PositionEmbeddingRandom
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from segment_anything import sam_model_registry, SamPredictor
+
 def fps_sampling(skel_tensor, num_samples=32):
     skel_np = skel_tensor.squeeze(0).cpu().numpy()  
     points = np.argwhere(skel_np > 0) 
@@ -37,6 +38,7 @@ def fps_sampling(skel_tensor, num_samples=32):
         selected.append(points_xy[index])
     selected = np.stack(selected, axis=0)
     return torch.from_numpy(selected)
+
 def compute_class_embedding(sam_feats, mask_tensor):
     feat_h, feat_w, feat_c = sam_feats.shape
     mask_resized = F.interpolate(mask_tensor.unsqueeze(0), size=(feat_h, feat_w), mode='nearest').squeeze(0)
